@@ -1,0 +1,913 @@
+package reatet;
+/* ReATestApp.java
+Single-file Java application (non-maven) that:
+- Parses Rego policies (heuristic) including defaults, rules, bindings, comprehensions
+- Builds a Rego Flow Graph (RFG) (nodes: START, RULE, CONDITION, BINDING, COMPREHENSION, DECISION, END)
+- Derives a CFG (control flow) from the RFG
+- Generates test cases by DFS over CFG/RFG paths
+- Optimizes test-case set using Grey Wolf Optimizer (GWO) with greedy fallback to set-cover
+- Simple Swing GUI with Load / Generate RFG / Generate Test Cases / Optimize (GWO) / Save Test Cases
+- Exports DOT files and calls Graphviz 'dot' to render PNGs if available
+*/
+
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.List;
+import java.util.regex.*;
+
+/**
+ * ReATestApp - Rego -> RFG -> TestGen -> GWO (real binary GWO).
+ *
+ * Key improvements:
+ * - DFS with cycle protection and path length limit
+ * - TestCase records: path nodes, coveredRules, coveredConditions (COND/BIND/COMP)
+ * - True GWO implemented on binary vectors representing selected testcases
+ * - Fitness = coverage_ratio - lambda * (selected_count / total_cases)
+ * - Coverage functions & logs before/after optimization
+ *
+ * Compile: javac ReATestApp.java
+ * Run: java reatest.ReATestApp
+ */
+public class ReATestApp extends JFrame {
+    private JTextArea logArea;
+    private JLabel imageLabel;
+    private JButton loadBtn, genRfgBtn, genTcBtn, optBtn, saveBtn, saveJsonBtn;
+    private File currentFile;
+
+    // RFG node/edge definitions
+    static class RNode {
+        String id;
+        String label;
+        String type; // START, END, RULE, CONDITION, BINDING, COMPREHENSION, DEFAULT, DECISION
+        RNode(String id, String label, String type) { this.id=id; this.label=label; this.type=type; }
+        @Override public String toString() { return String.format("%s(%s,%s)", id,label,type); }
+    }
+    static class REdge { RNode from, to; REdge(RNode f, RNode t){ from=f; to=t; } }
+
+    private List<RNode> nodes = new ArrayList<>();
+    private List<REdge> edges = new ArrayList<>();
+    // ruleNodes: ruleName -> list of rule nodes (to allow multiple definitions)
+    private Map<String, List<RNode>> ruleNodes = new LinkedHashMap<>();
+    // ruleBodies: ruleNode -> body nodes sequence
+    private Map<RNode, List<RNode>> ruleBodies = new HashMap<>();
+
+    private RNode startNode, endNode;
+    private Map<String, RNode> decisionNodes = new HashMap<>();
+
+    // TestCase
+    static class TestCase {
+        int id;
+        List<RNode> path = new ArrayList<>();
+        Set<String> coveredRules = new HashSet<>();
+        Set<String> coveredConds = new HashSet<>(); // includes CONDITION/BINDING/COMPREHENSION labels
+        @Override public String toString() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("covers=").append(coveredRules).append(", conds=").append(coveredConds).append(" | path=");
+            for (RNode n: path) sb.append(n.label).append(" -> ");
+            return sb.toString();
+        }
+        
+        // Convert to JSON format
+        public String toJson() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("    {\n");
+            sb.append("      \"id\": ").append(id).append(",\n");
+            sb.append("      \"covered_rules\": [");
+            if (!coveredRules.isEmpty()) {
+                for (String rule : coveredRules) {
+                    sb.append("\"").append(escapeJson(rule)).append("\", ");
+                }
+                sb.setLength(sb.length() - 2); // Remove trailing comma
+            }
+            sb.append("],\n");
+            sb.append("      \"covered_conditions\": [");
+            if (!coveredConds.isEmpty()) {
+                for (String cond : coveredConds) {
+                    sb.append("\"").append(escapeJson(cond)).append("\", ");
+                }
+                sb.setLength(sb.length() - 2); // Remove trailing comma
+            }
+            sb.append("],\n");
+            sb.append("      \"path\": [");
+            for (RNode node : path) {
+                sb.append("\"").append(escapeJson(node.label)).append("\", ");
+            }
+            if (!path.isEmpty()) {
+                sb.setLength(sb.length() - 2); // Remove trailing comma
+            }
+            sb.append("]\n");
+            sb.append("    }");
+            return sb.toString();
+        }
+        
+        private String escapeJson(String s) {
+            return s.replace("\\", "\\\\")
+                   .replace("\"", "\\\"")
+                   .replace("\b", "\\b")
+                   .replace("\f", "\\f")
+                   .replace("\n", "\\n")
+                   .replace("\r", "\\r")
+                   .replace("\t", "\\t");
+        }
+    }
+    private List<TestCase> allTestCases = new ArrayList<>();
+    private List<TestCase> optimizedTestCases = new ArrayList<>();
+    
+    // Thêm biến để lưu tổng số paths có thể
+    private int totalPossiblePaths = 0;
+
+    public ReATestApp() {
+        super("ReATest - Rego → RFG → TestGen → GWO (binary)");
+        setSize(1200,760);
+        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setLocationRelativeTo(null);
+        setLayout(new BorderLayout());
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        loadBtn = new JButton("Load Rego");
+        genRfgBtn = new JButton("Generate RFG");
+        genTcBtn = new JButton("Generate Test Cases");
+        optBtn = new JButton("Optimize (GWO)");
+        saveBtn = new JButton("Save Test Cases");
+        saveJsonBtn = new JButton("Save as JSON");
+        top.add(loadBtn); top.add(genRfgBtn); top.add(genTcBtn); top.add(optBtn); top.add(saveBtn); top.add(saveJsonBtn);
+        add(top, BorderLayout.NORTH);
+
+        logArea = new JTextArea();
+        logArea.setEditable(false);
+        JScrollPane left = new JScrollPane(logArea);
+        left.setPreferredSize(new Dimension(480,700));
+        add(left, BorderLayout.WEST);
+
+        imageLabel = new JLabel();
+        imageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        JScrollPane right = new JScrollPane(imageLabel);
+        add(right, BorderLayout.CENTER);
+
+        loadBtn.addActionListener(e->onLoad());
+        genRfgBtn.addActionListener(e->onGenerateRFG());
+        genTcBtn.addActionListener(e->onGenerateTestCases());
+        optBtn.addActionListener(e->onOptimizeGWO());
+        saveBtn.addActionListener(e->onSave());
+        saveJsonBtn.addActionListener(e->onSaveJson());
+
+        log("Ready. Load a Rego file to begin.");
+    }
+
+    private void log(String s) {
+        logArea.append(s + "\n");
+        logArea.setCaretPosition(logArea.getDocument().getLength());
+    }
+
+    private void onLoad() {
+        JFileChooser fc = new JFileChooser();
+        if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            currentFile = fc.getSelectedFile();
+            log("Loaded file: " + currentFile.getAbsolutePath());
+        }
+    }
+
+    private void onGenerateRFG() {
+        if (currentFile == null) { log("Please load a Rego file first."); return; }
+        try {
+            String content = new String(Files.readAllBytes(currentFile.toPath()), "UTF-8");
+            buildRFGFromRego(content);
+            String dot = exportRFGDot();
+            Files.write(Paths.get("rfg_output.dot"), dot.getBytes());
+            log("Wrote rfg_output.dot");
+
+            // render to PNG using graphviz dot (if available)
+            try {
+                Process p = new ProcessBuilder("dot", "-Tpng", "rfg_output.dot", "-o", "rfg_output.png").start();
+                int exit = p.waitFor();
+                if (exit == 0 && Files.exists(Paths.get("rfg_output.png"))) {
+                    log("Generated rfg_output.png");
+                    ImageIcon ic = new ImageIcon("rfg_output.png");
+                    Image img = ic.getImage();
+                    Image scaled = img.getScaledInstance(680, 680, Image.SCALE_SMOOTH);
+                    imageLabel.setIcon(new ImageIcon(scaled));
+                } else {
+                    log("Graphviz dot failed or not available. DOT file produced.");
+                    imageLabel.setIcon(null);
+                }
+            } catch (Exception ex) {
+                log("Graphviz render failed: " + ex.getMessage());
+                imageLabel.setIcon(null);
+            }
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            log("Error: " + ex.getMessage());
+        }
+    }
+
+    private void onGenerateTestCases() {
+        if (startNode == null) { log("Generate RFG first."); return; }
+        
+        // Ước lượng tổng số paths có thể trước
+        totalPossiblePaths = estimateTotalPossiblePaths();
+        log("Estimated total possible paths: " + totalPossiblePaths);
+        
+        // Sinh test cases
+        allTestCases = generateTestCasesDFS(10000);
+        
+        // Tính coverage dựa trên số paths đã sinh / tổng số paths có thể
+        double cov = totalPossiblePaths > 0 ? 
+            (double) allTestCases.size() / (double) totalPossiblePaths : 0.0;
+            
+        log("Generated test cases: " + allTestCases.size() + " / " + totalPossiblePaths + " possible paths");
+        log(String.format("Coverage (paths) before optimization: %.2f%% (%d/%d)",
+                cov*100, allTestCases.size(), totalPossiblePaths));
+                
+        for (int i=0;i<Math.min(allTestCases.size(), 20);i++) {
+            allTestCases.get(i).id = i+1;
+            log("TC" + (i+1) + ": " + allTestCases.get(i).toString());
+        }
+    }
+
+    private void onOptimizeGWO() {
+        if (allTestCases==null || allTestCases.isEmpty()) { log("Generate test cases first."); return; }
+        List<String> rules = new ArrayList<>();
+        for (List<RNode> ruleList : ruleNodes.values()) {
+            for (RNode rn : ruleList) {
+                rules.add(rn.label);
+            }
+        }
+        // GWO params: popSize, maxIter, lambda (penalty for size), seed
+        BinaryGWO gwo = new BinaryGWO(allTestCases, rules, 30, 200, 0.02, new Random());
+        optimizedTestCases = gwo.optimize();
+        log("Optimized testcases count: " + optimizedTestCases.size());
+        
+        // Tính coverage dựa trên số paths
+        double covBefore = totalPossiblePaths > 0 ? 
+            (double) allTestCases.size() / (double) totalPossiblePaths : 0.0;
+        double covAfter = totalPossiblePaths > 0 ? 
+            (double) optimizedTestCases.size() / (double) totalPossiblePaths : 0.0;
+            
+        log(String.format("Coverage before: %.2f%% (%d/%d), after: %.2f%% (%d/%d)", 
+                covBefore*100, allTestCases.size(), totalPossiblePaths,
+                covAfter*100, optimizedTestCases.size(), totalPossiblePaths));
+                
+        for (int i=0;i<Math.min(optimizedTestCases.size(), 20);i++) {
+            optimizedTestCases.get(i).id = i+1;
+            log("OPT" + (i+1) + ": " + optimizedTestCases.get(i).toString());
+        }
+    }
+
+    private void onSave() {
+        if (optimizedTestCases == null || optimizedTestCases.isEmpty()) { 
+            log("No optimized test cases to save."); return; 
+        }
+        JFileChooser fc = new JFileChooser();
+        fc.setSelectedFile(new File("optimized_testcases.txt"));
+        if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+            try (PrintWriter pw = new PrintWriter(fc.getSelectedFile())) {
+                for (int i=0;i<optimizedTestCases.size();i++)
+                    pw.println("TestCase " + (i+1) + ": " + optimizedTestCases.get(i).toString());
+                log("Saved optimized test cases to " + fc.getSelectedFile().getAbsolutePath());
+            } catch (Exception ex) { ex.printStackTrace(); log("Save error: " + ex.getMessage()); }
+        }
+    }
+
+    private void onSaveJson() {
+        if (optimizedTestCases == null || optimizedTestCases.isEmpty()) { 
+            log("No optimized test cases to save."); return; 
+        }
+        JFileChooser fc = new JFileChooser();
+        fc.setSelectedFile(new File("testcases.json"));
+        if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+            try (PrintWriter pw = new PrintWriter(fc.getSelectedFile())) {
+                pw.println("{\n  \"test_cases\": [");
+                for (int i=0;i<optimizedTestCases.size();i++) {
+                    optimizedTestCases.get(i).id = i+1;
+                    pw.println(optimizedTestCases.get(i).toJson());
+                    if (i < optimizedTestCases.size() - 1) {
+                        pw.println(",");
+                    }
+                }
+                pw.println("\n  ]\n}");
+                log("Saved test cases as JSON to " + fc.getSelectedFile().getAbsolutePath());
+            } catch (Exception ex) { ex.printStackTrace(); log("Save error: " + ex.getMessage()); }
+        }
+    }
+
+    // ==================== IMPROVED REGO PARSER ====================
+    private void resetGraph() {
+        nodes.clear(); edges.clear(); ruleNodes.clear(); ruleBodies.clear();
+        decisionNodes.clear();
+        totalPossiblePaths = 0;
+
+        startNode = makeNode("n_start","START","START"); nodes.add(startNode);
+        endNode = makeNode("n_end","END","END"); nodes.add(endNode);
+    }
+
+    private RNode makeNode(String id, String label, String type) {
+        return new RNode(id, label, type);
+    }
+
+    private void addEdge(RNode a, RNode b) {
+        edges.add(new REdge(a, b));
+    }
+
+    private void buildRFGFromRego(String content) {
+        resetGraph();
+
+        // Remove comments and normalize
+        content = content.replaceAll("(?s)/\\*.*?\\*/", " ")
+                .replaceAll("(?m)//.*$", " ")
+                .replaceAll("(?m)#.*$", " ")
+                .replace("\r\n", "\n")
+                .replace("\r", "\n");
+
+        log("Parsing Rego content...");
+
+        // Parse package
+        String packageName = parsePackage(content);
+        log("Package: " + packageName);
+
+        // Parse defaults
+        parseDefaults(content);
+
+        // Parse rules
+        parseRules(content);
+
+        // Connect
+        connectGraph();
+
+        log("RFG build complete. Nodes: " + nodes.size() + ", Edges: " + edges.size());
+        logRules();
+    }
+
+    private String parsePackage(String content) {
+        Pattern packagePattern = Pattern.compile("package\\s+([\\w.]+)");
+        Matcher matcher = packagePattern.matcher(content);
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return "unknown";
+    }
+
+    private void parseDefaults(String content) {
+        Pattern defaultPattern = Pattern.compile("default\\s+(\\w+)\\s*=\\s*([^\\s\\n]+)");
+        Matcher matcher = defaultPattern.matcher(content);
+
+        while (matcher.find()) {
+            String ruleName = matcher.group(1);
+            String defaultValue = matcher.group(2);
+
+            if (!decisionNodes.containsKey(ruleName)) {
+                RNode decisionNode = makeNode("decision_" + ruleName, ruleName.toUpperCase(), "DECISION");
+                nodes.add(decisionNode);
+                decisionNodes.put(ruleName, decisionNode);
+                addEdge(decisionNode, endNode);
+            }
+
+            RNode defaultNode = makeNode("default_" + ruleName,
+                    "default " + ruleName + " = " + defaultValue, "DEFAULT");
+            nodes.add(defaultNode);
+            addEdge(startNode, defaultNode);
+            addEdge(defaultNode, decisionNodes.get(ruleName));
+        }
+    }
+
+    private void parseRules(String content) {
+        String[] lines = content.split("\n");
+        StringBuilder currentRule = new StringBuilder();
+        String currentRuleName = null;
+        int braceBalance = 0;
+        boolean inRule = false;
+
+        for (int i = 0; i < lines.length; i++) {
+            String raw = lines[i];
+            String line = raw.trim();
+            if (line.isEmpty()) continue;
+
+            if (!inRule) {
+                if (isRuleStart(line)) {
+                    inRule = true;
+                    currentRuleName = extractRuleName(line);
+                    currentRule.setLength(0);
+                    currentRule.append(lines[i]).append("\n");
+                    braceBalance = countBraces(line) - countClosingBraces(line);
+                    if (braceBalance <= 0) {
+                        // single-line rule or no braces
+                        processRule(currentRuleName, currentRule.toString());
+                        inRule = false; currentRuleName = null;
+                    }
+                }
+            } else {
+                currentRule.append(lines[i]).append("\n");
+                braceBalance += countBraces(lines[i]) - countClosingBraces(lines[i]);
+                if (braceBalance <= 0) {
+                    processRule(currentRuleName, currentRule.toString());
+                    inRule = false; currentRuleName = null;
+                    currentRule.setLength(0);
+                }
+            }
+        }
+
+        if (inRule && currentRuleName != null) {
+            processRule(currentRuleName, currentRule.toString());
+        }
+    }
+
+    private boolean isRuleStart(String line) {
+        // match patterns like: name {  OR  name[key] {  OR  name = value
+        return line.matches("^[a-zA-Z_][a-zA-Z0-9_]*\\s*.*\\{.*") ||
+                line.matches("^[a-zA-Z_][a-zA-Z0-9_]*\\s*=\\s*[^\\s{]+.*") ||
+                line.matches("^[a-zA-Z_][a-zA-Z0-9_]*\\s*\\[.*\\].*");
+    }
+
+    private String extractRuleName(String line) {
+        if (line.contains("=")) {
+            return line.split("\\s*=")[0].trim();
+        } else if (line.contains("[")) {
+            return line.split("\\[")[0].trim();
+        } else if (line.contains("{")) {
+            return line.split("\\s*\\{")[0].trim();
+        }
+        return line.split("\\s+")[0];
+    }
+
+    private int countBraces(String line) {
+        int c=0; for (char ch: line.toCharArray()) if (ch=='{') c++; return c;
+    }
+    private int countClosingBraces(String line) {
+        int c=0; for (char ch: line.toCharArray()) if (ch=='}') c++; return c;
+    }
+
+    private void processRule(String ruleName, String ruleContent) {
+        log("Processing rule: " + ruleName);
+        if (ruleContent.trim().startsWith("default")) return;
+
+        List<RNode> ruleList = ruleNodes.getOrDefault(ruleName, new ArrayList<>());
+        String ruleId = "rule_" + ruleName + "_" + ruleList.size();
+        RNode ruleNode = makeNode(ruleId, ruleName, "RULE");
+        nodes.add(ruleNode);
+        ruleList.add(ruleNode);
+        ruleNodes.put(ruleName, ruleList);
+        addEdge(startNode, ruleNode);
+
+        List<RNode> bodyNodes = parseRuleBody(ruleContent, ruleName, ruleList.size());
+        ruleBodies.put(ruleNode, bodyNodes);
+
+        if (!bodyNodes.isEmpty()) addEdge(ruleNode, bodyNodes.get(0));
+
+        RNode lastNode = bodyNodes.isEmpty() ? ruleNode : bodyNodes.get(bodyNodes.size()-1);
+
+        if (!decisionNodes.containsKey(ruleName)) {
+            RNode decisionNode = makeNode("decision_" + ruleName, ruleName.toUpperCase(), "DECISION");
+            nodes.add(decisionNode);
+            decisionNodes.put(ruleName, decisionNode);
+            addEdge(decisionNode, endNode);
+        }
+        addEdge(lastNode, decisionNodes.get(ruleName));
+    }
+
+    private List<RNode> parseRuleBody(String ruleContent, String ruleName, int ruleIndex) {
+        List<RNode> bodyNodes = new ArrayList<>();
+        try {
+            int startBrace = ruleContent.indexOf('{');
+            int endBrace = ruleContent.lastIndexOf('}');
+            if (startBrace == -1 || endBrace == -1 || startBrace >= endBrace) {
+                // rule without body or assignment
+                if (ruleContent.contains("=") && !ruleContent.contains("{")) {
+                    String assignment = ruleContent.split("=",2)[1].trim();
+                    if (assignment.endsWith("}")) assignment = assignment.substring(0, assignment.length()-1).trim();
+                    RNode assignNode = makeNode("assign_" + ruleName + "_" + ruleIndex, "= " + assignment, "BINDING");
+                    bodyNodes.add(assignNode);
+                }
+                return bodyNodes;
+            }
+            String body = ruleContent.substring(startBrace+1, endBrace).trim();
+            if (body.isEmpty()) return bodyNodes;
+            // split on newline or semicolon to get conditions
+            String[] conditions = body.split("\\n|;");
+            RNode prev=null;
+            int condIndex=0;
+            for (String cond : conditions) {
+                cond = cond.trim();
+                if (cond.isEmpty()) continue;
+                RNode node = createConditionNode(cond, ruleName, ruleIndex, condIndex++);
+                if (node!=null) {
+                    nodes.add(node);
+                    bodyNodes.add(node);
+                    if (prev!=null) addEdge(prev, node);
+                    prev=node;
+                }
+            }
+        } catch (Exception e) {
+            log("Error parsing rule body for " + ruleName + ": " + e.getMessage());
+        }
+        return bodyNodes;
+    }
+
+    private RNode createConditionNode(String condition, String ruleName, int ruleIndex, int condIndex) {
+        String nodeId = "cond_" + ruleName + "_" + ruleIndex + "_" + condIndex;
+        String clean = condition.replaceAll("\\s+", " ").trim();
+        // heuristics to categorize
+        if (clean.contains(":=") || clean.matches(".*:=.*")) {
+            return makeNode(nodeId, "Bind: " + clean, "BINDING");
+        } else if (clean.matches(".*\\bsome\\b.*")) {
+            return makeNode(nodeId, "Some: " + clean, "CONDITION");
+        } else if (clean.matches(".*\\[.*\\].*") || clean.matches(".*\\bfor.*in.*")) {
+            return makeNode(nodeId, "Comp: " + clean, "COMPREHENSION");
+        } else if (clean.contains("==") || clean.contains("!=") || clean.contains(">") || clean.contains("<") || clean.contains(" in ")) {
+            return makeNode(nodeId, "Cond: " + clean, "CONDITION");
+        } else {
+            return makeNode(nodeId, "Cond: " + clean, "CONDITION");
+        }
+    }
+
+    private void connectGraph() {
+        for (RNode decisionNode : decisionNodes.values()) {
+            boolean hasOutgoing=false;
+            for (REdge e: edges) if (e.from==decisionNode) { hasOutgoing=true; break; }
+            if (!hasOutgoing) addEdge(decisionNode, endNode);
+        }
+    }
+
+    private void logRules() {
+        log("=== RULES FOUND ===");
+        for (String ruleName : ruleNodes.keySet()) {
+            List<RNode> ruleList = ruleNodes.get(ruleName);
+            for (int i=0;i<ruleList.size();i++) {
+                RNode rn = ruleList.get(i);
+                log("Rule: " + ruleName + " [" + (i+1) + "]");
+                List<RNode> body = ruleBodies.get(rn);
+                if (body!=null) {
+                    for (RNode n: body) log("  -> " + n.label);
+                }
+            }
+        }
+        log("=== DECISIONS FOUND ===");
+        for (String dn : decisionNodes.keySet()) {
+            log("Decision: " + dn);
+        }
+    }
+
+    // ==================== DOT EXPORT ====================
+    private String exportRFGDot() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("digraph RFG {\n");
+        sb.append("  rankdir=TB;\n");
+        sb.append("  node [fontsize=10, fontname=\"Arial\"];\n");
+        sb.append("  edge [fontsize=9];\n\n");
+        for (RNode n: nodes) {
+            String shape="box", color="lightblue";
+            switch(n.type) {
+                case "START": shape="circle"; color="green"; break;
+                case "END": shape="doublecircle"; color="red"; break;
+                case "DECISION": shape="diamond"; color="orange"; break;
+                case "DEFAULT": shape="ellipse"; color="lightgray"; break;
+                case "CONDITION": shape="oval"; color="white"; break;
+                case "BINDING": shape="parallelogram"; color="lightyellow"; break;
+                case "COMPREHENSION": shape="hexagon"; color="lightgreen"; break;
+                case "RULE": shape="box"; color="lightblue"; break;
+            }
+            sb.append("  ").append(escapeId(n.id))
+              .append(" [label=\"").append(escapeLabel(n.label))
+              .append("\", shape=").append(shape)
+              .append(", style=filled, fillcolor=").append(color).append("];\n");
+        }
+        sb.append("\n");
+        for (REdge e: edges) {
+            sb.append("  ").append(escapeId(e.from.id)).append(" -> ").append(escapeId(e.to.id)).append(";\n");
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private String escapeId(String id) {
+        return id.replaceAll("[^a-zA-Z0-9_]", "_");
+    }
+
+    private String escapeLabel(String label) {
+        return label.replace("\"", "\\\"").replace("\n","\\n").replace("{","\\{").replace("}","\\}");
+    }
+
+    // ==================== PATH COUNTING AND TEST CASE GENERATION ====================
+    
+    // Ước lượng tổng số paths có thể từ START đến END
+    private int estimateTotalPossiblePaths() {
+        if (startNode == null || endNode == null) return 0;
+        
+        // Sử dụng BFS với giới hạn để đếm số paths
+        int maxPathsToCount = 10000; // Giới hạn để tránh tràn bộ nhớ
+        int pathCount = 0;
+        
+        Queue<List<RNode>> queue = new LinkedList<>();
+        List<RNode> initialPath = new ArrayList<>();
+        initialPath.add(startNode);
+        queue.offer(initialPath);
+        
+        while (!queue.isEmpty() && pathCount < maxPathsToCount) {
+            List<RNode> currentPath = queue.poll();
+            RNode lastNode = currentPath.get(currentPath.size() - 1);
+            
+            if (lastNode == endNode) {
+                pathCount++;
+                continue;
+            }
+            
+            // Thêm các neighbors vào queue
+            for (REdge edge : edges) {
+                if (edge.from == lastNode) {
+                    // Tránh cycle - không quay lại node đã đi qua trong path hiện tại
+                    if (!currentPath.contains(edge.to)) {
+                        List<RNode> newPath = new ArrayList<>(currentPath);
+                        newPath.add(edge.to);
+                        if (newPath.size() <= nodes.size() * 2) { // Giới hạn độ dài path
+                            queue.offer(newPath);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return pathCount;
+    }
+
+    private List<TestCase> generateTestCasesDFS(int maxPaths) {
+        List<TestCase> result = new ArrayList<>();
+        if (startNode == null) return result;
+
+        // We'll do a DFS from startNode collecting paths to END.
+        Deque<RNode> path = new ArrayDeque<>();
+        Set<RNode> onStack = new HashSet<>();
+        path.push(startNode);
+        onStack.add(startNode);
+
+        int maxDepth = Math.max(50, nodes.size() * 2); // limit depth
+        dfs(startNode, path, onStack, result, maxPaths, maxDepth);
+
+        // Post-process: ensure unique coverage sets
+        List<TestCase> unique = new ArrayList<>();
+        Set<String> sigs = new HashSet<>();
+        for (TestCase tc : result) {
+            String sig = String.join("|", tc.coveredRules) + "||" + String.join("|", tc.coveredConds);
+            if (!sigs.contains(sig)) {
+                sigs.add(sig);
+                unique.add(tc);
+            }
+        }
+        return unique;
+    }
+
+    private void dfs(RNode current, Deque<RNode> path, Set<RNode> onStack,
+                     List<TestCase> result, int maxPaths, int maxDepth) {
+        if (result.size() >= maxPaths) return;
+        if (path.size() > maxDepth) return;
+
+        if (current.type.equals("END")) {
+            // build TestCase
+            TestCase tc = new TestCase();
+            tc.path.addAll(new ArrayList<>(path));
+            // record covered rules and conditions
+            for (RNode n : path) {
+                if (n.type.equals("RULE")) tc.coveredRules.add(n.label);
+                if (n.type.equals("CONDITION") || n.type.equals("BINDING") || n.type.equals("COMPREHENSION"))
+                    tc.coveredConds.add(n.label);
+            }
+            result.add(tc);
+            return;
+        }
+
+        // get neighbors
+        List<RNode> neighbors = new ArrayList<>();
+        for (REdge e: edges) {
+            if (e.from == current) neighbors.add(e.to);
+        }
+
+        // Explore neighbors; allow revisiting decision nodes but avoid immediate cycles by onStack check
+        for (RNode nb : neighbors) {
+            if (onStack.contains(nb)) {
+                // allow visiting END even if onStack (END won't be in stack frequently)
+                if (!nb.type.equals("END")) continue;
+            }
+            path.push(nb);
+            onStack.add(nb);
+
+            dfs(nb, path, onStack, result, maxPaths, maxDepth);
+
+            path.pop();
+            onStack.remove(nb);
+            if (result.size() >= maxPaths) break;
+        }
+    }
+
+    // ==================== COVERAGE UTILITIES ====================
+    private List<String> getAllRuleLabels() {
+        List<String> res = new ArrayList<>();
+        for (List<RNode> list : ruleNodes.values())
+            for (RNode rn : list) res.add(rn.label);
+        return res;
+    }
+
+    // Tính coverage theo số paths đã sinh / tổng số paths có thể
+    private double computePathCoverage(List<TestCase> tcs) {
+        if (tcs == null || tcs.isEmpty()) return 0.0;
+        if (totalPossiblePaths == 0) return 0.0;
+        return (double) tcs.size() / (double) totalPossiblePaths;
+    }
+
+    private Set<String> unionCoveredRules(List<TestCase> tcs) {
+        Set<String> cov = new HashSet<>();
+        for (TestCase tc : tcs) cov.addAll(tc.coveredRules);
+        return cov;
+    }
+
+    // ==================== BINARY GWO OPTIMIZER ====================
+    static class BinaryGWO {
+        List<TestCase> cases;
+        List<String> rules;
+        int popSize;
+        int maxIter;
+        double lambda; // penalty for number of selected testcases (0..1)
+        Random rnd;
+
+        BinaryGWO(List<TestCase> cases, List<String> rules, int popSize, int maxIter, double lambda, Random rnd) {
+            this.cases = cases;
+            this.rules = rules;
+            this.popSize = Math.max(5, popSize);
+            this.maxIter = Math.max(10, maxIter);
+            this.lambda = Math.max(0.0, lambda);
+            this.rnd = rnd == null ? new Random() : rnd;
+        }
+
+        List<TestCase> optimize() {
+            int n = cases.size();
+            if (n == 0) return new ArrayList<>();
+
+            // Initialize population: each wolf is binary vector length n
+            List<boolean[]> wolves = new ArrayList<>();
+            for (int i=0;i<popSize;i++) {
+                boolean[] v = new boolean[n];
+                // initialize with greedy bias: pick a random test or use probability
+                for (int j=0;j<n;j++) v[j] = rnd.nextDouble() < 0.15; // sparse start
+                wolves.add(v);
+            }
+
+            // ensure at least one selected in some wolves
+            wolves.get(0)[0] = true;
+
+            // Evaluate and keep alpha,beta,delta
+            double[] fitness = new double[popSize];
+            for (int i=0;i<popSize;i++) fitness[i] = evalFitness(wolves.get(i));
+            // find initial alpha/beta/delta indices
+            int alphaIdx = 0, betaIdx = 0, deltaIdx = 0;
+            // sort by fitness
+            Integer[] order = new Integer[popSize];
+            for (int i=0;i<popSize;i++) order[i]=i;
+            Arrays.sort(order, (a,b)-> Double.compare(fitness[b], fitness[a]));
+            alphaIdx = order[0]; betaIdx = order[Math.min(1, popSize-1)]; deltaIdx = order[Math.min(2, popSize-1)];
+
+            // GWO main loop
+            for (int iter=0; iter<maxIter; iter++) {
+                double a = 2.0 * (1.0 - (double)iter / (double)maxIter); // linearly decreasing
+                boolean[] alpha = wolves.get(alphaIdx);
+                boolean[] beta = wolves.get(betaIdx);
+                boolean[] delta = wolves.get(deltaIdx);
+
+                // update each wolf
+                for (int i=0;i<popSize;i++) {
+                    boolean[] X = wolves.get(i);
+                    boolean[] newX = new boolean[n];
+                    for (int j=0;j<n;j++) {
+                        // positions are binary; we use probability transformation using A and C coefficients analogy
+                        // compute influence from alpha,beta,delta
+                        double r1 = rnd.nextDouble(), r2 = rnd.nextDouble();
+                        double A1 = 2.0 * a * r1 - a;
+                        double C1 = 2.0 * r2;
+
+                        r1 = rnd.nextDouble(); r2 = rnd.nextDouble();
+                        double A2 = 2.0 * a * r1 - a;
+                        double C2 = 2.0 * r2;
+
+                        r1 = rnd.nextDouble(); r2 = rnd.nextDouble();
+                        double A3 = 2.0 * a * r1 - a;
+                        double C3 = 2.0 * r2;
+
+                        // transform neighbor values (0/1) into continuous influence
+                        double D_alpha = Math.abs(C1 * (alpha[j] ? 1 : 0) - (X[j] ? 1 : 0));
+                        double X1 = (alpha[j] ? 1 : 0) - A1 * D_alpha;
+
+                        double D_beta = Math.abs(C2 * (beta[j] ? 1 : 0) - (X[j] ? 1 : 0));
+                        double X2 = (beta[j] ? 1 : 0) - A2 * D_beta;
+
+                        double D_delta = Math.abs(C3 * (delta[j] ? 1 : 0) - (X[j] ? 1 : 0));
+                        double X3 = (delta[j] ? 1 : 0) - A3 * D_delta;
+
+                        double Xnew_cont = (X1 + X2 + X3) / 3.0;
+                        // map to probability via sigmoid-like
+                        double prob = 1.0 / (1.0 + Math.exp(-10.0*(Xnew_cont - 0.5))); // steep sigmoid
+                        newX[j] = rnd.nextDouble() < prob;
+                    }
+                    wolves.set(i, newX);
+                    fitness[i] = evalFitness(newX);
+                }
+
+                // update alpha,beta,delta indices
+                Integer[] ord = new Integer[popSize];
+                for (int i=0;i<popSize;i++) ord[i]=i;
+                Arrays.sort(ord, (i, j) -> Double.compare(fitness[j], fitness[i]));
+
+                alphaIdx = ord[0];
+                betaIdx = ord[Math.min(1, popSize-1)];
+                deltaIdx = ord[Math.min(2, popSize-1)];
+            }
+
+            // result: take alpha vector -> selected testcases
+            boolean[] best = wolves.get(alphaIdx);
+            List<TestCase> selected = new ArrayList<>();
+            for (int i=0;i<best.length;i++) if (best[i]) selected.add(cases.get(i));
+
+            // If coverage not full and greedy can help, run a final greedy cover addition
+            Set<String> covered = new HashSet<>();
+            for (TestCase tc : selected) covered.addAll(tc.coveredRules);
+            Set<String> allRules = new HashSet<>(rules);
+            if (!covered.containsAll(allRules)) {
+                // greedy add remaining
+                boolean added = true;
+                Set<Integer> already = new HashSet<>();
+                for (int i=0;i<best.length;i++) if (best[i]) already.add(i);
+                while (added) {
+                    added = false;
+                    int bestIdx = -1; int bestCov = 0;
+                    for (int i=0;i<cases.size();i++) {
+                        if (already.contains(i)) continue;
+                        Set<String> cov = new HashSet<>(cases.get(i).coveredRules);
+                        cov.removeAll(covered);
+                        if (cov.size() > bestCov) {
+                            bestCov = cov.size(); bestIdx = i;
+                        }
+                    }
+                    if (bestIdx != -1) {
+                        selected.add(cases.get(bestIdx));
+                        already.add(bestIdx);
+                        covered.addAll(cases.get(bestIdx).coveredRules);
+                        added = true;
+                    }
+                }
+            }
+
+            // minimize: try to remove redundant testcases if coverage preserved (set-cover reduction)
+            selected = minimizeSelected(selected, rules);
+
+            return selected;
+        }
+
+        // evaluate fitness: combine coverage ratio and penalty for selection size
+        private double evalFitness(boolean[] vec) {
+            Set<String> cov = new HashSet<>();
+            int count = 0;
+            for (int i=0;i<vec.length;i++) {
+                if (vec[i]) {
+                    count++;
+                    cov.addAll(cases.get(i).coveredRules);
+                }
+            }
+            double coverageRatio = rules.isEmpty() ? 0.0 : (double)cov.size() / (double)rules.size();
+            double sizePenalty = (double)count / (double)vec.length;
+            return coverageRatio - lambda * sizePenalty;
+        }
+
+        // try to remove redundant testcases while preserving coverage
+        private List<TestCase> minimizeSelected(List<TestCase> selected, List<String> rules) {
+            List<TestCase> list = new ArrayList<>(selected);
+            boolean changed = true;
+            Set<String> allRulesSet = new HashSet<>(rules);
+            while (changed) {
+                changed = false;
+                // compute current coverage
+                Set<String> cov = new HashSet<>();
+                for (TestCase tc : list) cov.addAll(tc.coveredRules);
+                for (int i = 0; i < list.size(); i++) {
+                    TestCase tc = list.get(i);
+                    // compute coverage without this tc
+                    Set<String> cov2 = new HashSet<>(cov);
+                    cov2.removeAll(tc.coveredRules);
+                    if (cov2.containsAll(allRulesSet)) {
+                        // we can remove this tc
+                        list.remove(i);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            return list;
+        }
+    }
+
+    // ==================== MAIN METHOD ====================
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            ReATestApp app = new ReATestApp();
+            app.setVisible(true);
+        });
+    }
+}
