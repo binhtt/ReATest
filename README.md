@@ -27,5 +27,5 @@ This repository contains:
 - ✅ Seamless integration into **DevSecOps pipelines**  
 - ✅ Interactive GUI for policy visualization and coverage comparison
 
----
+
 
